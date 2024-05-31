@@ -26,11 +26,11 @@ struct DataBuf {
 
 struct DataRingBuf {
     /* instance name */
-    const char *instance_name;                              
+    const char *instance_name;
     /* buf write index, initial value is -1 */
     int index;
     /* instance run times */
-    uint64_t count;                                
+    uint64_t count;
     struct DataBuf *buf;
     int buf_len;
 };
@@ -49,7 +49,7 @@ struct Interface {
      * for instance execution.
      */
     const char* (*get_dep)();
-    /* Instance scheduling priority. In a uniform time period, a instance with a 
+    /* Instance scheduling priority. In a uniform time period, a instance with a
      * lower priority is scheduled first.
      */
     int (*get_priority)();
