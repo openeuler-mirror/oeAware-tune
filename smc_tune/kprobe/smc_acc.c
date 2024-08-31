@@ -18,114 +18,114 @@
 #include <linux/sockptr.h>
 #include <linux/net.h>
 
-
-static struct kprobe kp_bind = {
-    .symbol_name = "__sys_bind",
-};
-static struct kprobe kp_connect = {
-    .symbol_name = "__sys_connect"
+static struct kprobe kp_sc = {
+    .symbol_name = "__sock_create",
 };
 
-
-#define SMCPROTO_SMC		0	/* SMC protocol, IPv4 */
-#define SMCPROTO_SMC6		1	/* SMC protocol, IPv6 */
-#define FDPUT_FPUT          1
-// di stand for first arg
-// si stand for second arg
-// dx stand for third arg
-
-#define AF_SMC		43
-
-
-static int handler_smc(int ifd) {
-    long ret;
-    int tmperr;
-    struct socket *sock;
-    
-    struct fd f = fdget(ifd);
-    if (!f.file) {
-        fdput(f);
-        return 0;
-    }
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 10, 0)
-    sock = sock_from_file(f.file, &tmperr);
-#else
-    sock = sock_from_file(f.file);
+#ifdef __x86_64__
+#define REGS_PARM1(x) ((x)->di)
+#define REGS_PARM2(x) ((x)->si)
+#define REGS_PARM3(x) ((x)->dx)
+#define REGS_PARM4(x) ((x)->cx)
+#define REGS_PARM5(x) ((x)->r8)
+#define REGS_PARM6(x) ((x)->r9)
+#elif defined(__aarch64__)
+#define REGS_PARM1(x) ((x)->regs[0])
+#define REGS_PARM2(x) ((x)->regs[1])
+#define REGS_PARM3(x) ((x)->regs[2])
+#define REGS_PARM4(x) ((x)->regs[3])
+#define REGS_PARM5(x) ((x)->regs[4])
+#define REGS_PARM6(x) ((x)->regs[5])
 #endif
 
-    if (sock) {
-        struct sock * sk = sock->sk;
-        if (sk) {
-            u16 protocol = sk->sk_protocol;
-            u16 family = sk->sk_family;
-            u16 type = sk->sk_type;
-            if ((family == AF_INET || family == AF_INET6) &&
-                ((type & 0xf) == SOCK_STREAM ) &&
-                (protocol == IPPROTO_TCP || protocol == IPPROTO_IP)) {
-                    ret = tcp_setsockopt(sk, SOL_TCP, TCP_ULP, KERNEL_SOCKPTR("smc"), sizeof("smc"));
-                    if (ret) {
-                        printk(KERN_INFO "kprobe: bind or listen failed to set smc failed error id : %ld\n", ret);
-                    }
-            }
-        }
+#define SMCPROTO_SMC 0  /* SMC protocol, IPv4 */
+#define SMCPROTO_SMC6 1 /* SMC protocol, IPv6 */
+#define FDPUT_FPUT 1
 
-    }
-    fdput(f);
+#define AF_SMC 43
+
+#define SMC_LOADED 0
+#define SMC_UNLOADED 1
+static int is_smc_loaded = SMC_LOADED;
+
+static unsigned long (*kallsyms_lookup_name_sym)(const char *name);
+static int _kallsyms_lookup_kprobe(struct kprobe *p, struct pt_regs *regs)
+{
     return 0;
 }
 
-
-static int __kprobes handler_bind_pre(struct kprobe *p, struct pt_regs *regs)
+unsigned long get_kallsyms_func(char *func_name)
 {
-    int ifd;
-#ifdef __x86_64__
-    ifd = (int)((regs)->di);
-#elif defined(__aarch64__)
-    ifd = (int)((regs)->regs[0]);
-#endif
-    if (!p) {
+    struct kprobe probe;
+    int ret;
+    unsigned long addr;
+
+    memset(&probe, 0, sizeof(probe));
+    probe.pre_handler = _kallsyms_lookup_kprobe;
+    probe.symbol_name = func_name;
+    ret               = register_kprobe(&probe);
+    if (ret)
         return 0;
+    addr = (unsigned long)probe.addr;
+    unregister_kprobe(&probe);
+    return addr;
+}
+
+unsigned long generic_kallsyms_lookup_name(const char *name)
+{
+    if (!kallsyms_lookup_name_sym) {
+        kallsyms_lookup_name_sym = (void *)get_kallsyms_func("kallsyms_lookup_name");
+        if (!kallsyms_lookup_name_sym)
+            return 0;
     }
-    
-    handler_smc(ifd);
+    return kallsyms_lookup_name_sym(name);
+}
+
+static int __init check_smc_module(void)
+{
+    if (generic_kallsyms_lookup_name("smc_ism_init") == 0) {
+        printk(KERN_ERR "SMC module is not loaded.\n");
+        return 1;
+    }
     return 0;
 }
 
-
-
-static int __kprobes handler_connect_pre(struct kprobe *p, struct pt_regs *regs)
+static int __kprobes handler_sk_create_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    int ifd;
-#ifdef __x86_64__
-    ifd = (int)((regs)->di);
-#elif defined(__aarch64__)
-    ifd = (int)((regs)->regs[0]);
-#endif
-    if (!p) {
-        return 0;
+    int kern     = (int)REGS_PARM6(regs);
+    int family   = (int)REGS_PARM2(regs);
+    int type     = (int)REGS_PARM3(regs);
+    int protocol = (int)REGS_PARM4(regs);
+
+    if (!kern && (family == AF_INET || family == AF_INET6) && type == SOCK_STREAM &&
+        (protocol == IPPROTO_IP || protocol == IPPROTO_TCP)) {
+        REGS_PARM4(regs) = (family == AF_INET) ? SMCPROTO_SMC : SMCPROTO_SMC6;
+        REGS_PARM2(regs) = AF_SMC;
     }
 
-    handler_smc(ifd);
     return 0;
 }
 
 static int __init kprobe_init(void)
 {
-    kp_bind.pre_handler = handler_bind_pre;
-    kp_connect.pre_handler = handler_connect_pre;
-    register_kprobe(&kp_bind);
+    if (check_smc_module() != 0) {
+        is_smc_loaded = SMC_UNLOADED;
+        return -ENOENT;
+    }
+    kp_sc.pre_handler = handler_sk_create_pre;
 
-    register_kprobe(&kp_connect);
+    register_kprobe(&kp_sc);
+
     printk(KERN_INFO "smc_acc : module loaded\n");
     return 0;
 }
 
 static void __exit kprobe_exit(void)
 {
-    unregister_kprobe(&kp_bind);
-    unregister_kprobe(&kp_connect);
+    if (is_smc_loaded == SMC_UNLOADED)
+        return;
 
+    unregister_kprobe(&kp_sc);
     printk(KERN_INFO "smc_acc : module unloaded\n");
 }
 
